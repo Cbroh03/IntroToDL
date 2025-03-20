@@ -147,12 +147,11 @@ e2f_dataset = EngFrDataset(text)
 dataloader = DataLoader(e2f_dataset, batch_size=1, shuffle=True)
 
 class Encoder(nn.Module):
-    """The Encoder part of the seq2seq model."""
     def __init__(self, input_size, hidden_size):
         super(Encoder, self).__init__()
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, hidden_size)  # Embedding layer
-        self.gru = nn.GRU(hidden_size, hidden_size)  # GRU layer
+        self.embedding = nn.Embedding(input_size, hidden_size) # Embedding layer
+        self.gru = nn.GRU(hidden_size, hidden_size) # GRU layer
     
     def forward(self, input, hidden):
         embedded = self.embedding(input).view(1, 1, -1)
@@ -161,27 +160,44 @@ class Encoder(nn.Module):
     
     def initHidden(self):
         return torch.zeros(1, 1, self.hidden_size, device=device)
-
-class Decoder(nn.Module):
-    """The Decoder part of the seq2seq model."""
-    def __init__(self, hidden_size, output_size):
-        super(Decoder, self).__init__()
+    
+class AttentionDecoder(nn.Module):
+    def __init__(self, hidden_size, output_size, max_length=16, dropout_p=0.1):
+        super(AttentionDecoder, self).__init__()
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
-        self.softmax = nn.LogSoftmax(dim=1)
+        self.output_size = output_size
+        self.dropout_p = dropout_p
+        self.max_length = max_length
+        
+        self.embedding = nn.Embedding(self.output_size, self.hidden_size) # Embedding layer
+        self.attn = nn.Linear(self.hidden_size * 2, self.max_length) # Attention layer
+        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size) # Combining layer
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.gru = nn.GRU(self.hidden_size, self.hidden_size)
+        self.out = nn.Linear(self.hidden_size, output_size)
     
-    def forward(self, input, hidden):
+    def forward(self, input, hidden, encoder_outputs):
         embedded = self.embedding(input).view(1, 1, -1)
-        output, hidden = self.gru(embedded, hidden)
-        output = self.softmax(self.out(output[0]))
-        return output, hidden
+        embedded = self.dropout(embedded)
+
+        # Calculating attention weights
+        attn_weights = torch.softmax(self.attn(torch.cat((embedded[0], hidden[0]), 1)), dim=1)
+        attn_applied = torch.bmm(attn_weights.unsqueeze(0), encoder_outputs.unsqueeze(0))
+
+        # Combining embedded input with attention output
+        output = torch.cat((embedded[0], attn_applied[0]), 1)
+        output = self.attn_combine(output).unsqueeze(0)
+
+        output = torch.relu(output)
+        output, hidden = self.gru(output, hidden)
+
+        output = torch.log_softmax(self.out(output[0]), dim=1)
+        return output, hidden, attn_weights
     
     def initHidden(self):
         return torch.zeros(1, 1, self.hidden_size, device=device)
     
-def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion):
+def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, max_length=16):
     # Initialize encoder hidden state
     encoder_hidden = encoder.initHidden()
 
@@ -194,8 +210,10 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
     loss = 0
 
     # Encoding each character in the input
+    encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
     for ei in range(input_length):
         encoder_output, encoder_hidden = encoder(input_tensor[ei].unsqueeze(0), encoder_hidden)
+        encoder_outputs[ei] = encoder_output[0, 0]
 
     # Decoder's first input is the SOS token
     decoder_input = torch.tensor([[SOS_token]], device=device)
@@ -203,14 +221,13 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
     # Decoder starts with encoder's last hidden state
     decoder_hidden = encoder_hidden
 
-    # Decoding loop
+   # Decoding loop with attention
     for di in range(target_length):
-        decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
-        # Choose top1 word from decoder's output
+        decoder_output, decoder_hidden, decoder_attention = decoder(
+            decoder_input, decoder_hidden, encoder_outputs)
         topv, topi = decoder_output.topk(1)
         decoder_input = topi.squeeze().detach()  # Detach from history as input
 
-        # Calculate loss
         loss += criterion(decoder_output, target_tensor[di].unsqueeze(0))
         if decoder_input.item() == EOS_token:
             break
@@ -240,7 +257,7 @@ def train__loop(encoder, decoder, encoder_optimizer, decoder_optimizer, criterio
         if epoch % 5 == 0:
             print(f'Epoch {epoch}, Loss: {total_loss / len(dataloader)}')
 
-def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, n_examples=10):
+def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, n_examples=10, max_length=16):
     # Switch model to evaluation mode
     encoder.eval()
     decoder.eval()
@@ -262,9 +279,11 @@ def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, n_exampl
 
             loss = 0
 
-            # Encoding step
+            # Encoding each character in the input
+            encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
             for ei in range(input_length):
                 encoder_output, encoder_hidden = encoder(input_tensor[ei].unsqueeze(0), encoder_hidden)
+                encoder_outputs[ei] = encoder_output[0, 0]
 
             # Decoding step
             decoder_input = torch.tensor([[SOS_token]], device=device)
@@ -273,7 +292,7 @@ def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, n_exampl
             predicted_indices = []
 
             for di in range(target_length):
-                decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden)
+                decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input, decoder_hidden, encoder_outputs)
                 topv, topi = decoder_output.topk(1)
                 predicted_indices.append(topi.item())
                 decoder_input = topi.squeeze().detach()
@@ -281,6 +300,7 @@ def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, n_exampl
                 loss += criterion(decoder_output, target_tensor[di].unsqueeze(0))
                 if decoder_input.item() == EOS_token:
                     break
+
 
             # Calculate and print loss and accuracy for the evaluation
             total_loss += loss.item() / target_length
@@ -300,7 +320,7 @@ def evaluate_and_show_examples(encoder, decoder, dataloader, criterion, n_exampl
         accuracy = correct_predictions / len(dataloader)
         print(f'Evaluation Loss: {average_loss:.4f}, Accuracy: {100*accuracy:.2f}%')
 
-# Params
+#Params
 epochs = 51
 learning_rate = 0.01
 hidden_size = 1028
@@ -308,7 +328,7 @@ hidden_size = 1028
 input_size = len(e2f_dataset.eng_vocab.word2index)
 output_size = len(e2f_dataset.fr_vocab.word2index)
 encoder = Encoder(input_size=input_size, hidden_size=hidden_size).to(device)
-decoder = Decoder(hidden_size=hidden_size, output_size=output_size).to(device)
+decoder = AttentionDecoder(hidden_size=hidden_size, output_size=output_size).to(device)
 
 # Optimizers
 encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
